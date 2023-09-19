@@ -1,0 +1,34 @@
+#%Module1.0
+
+set prefix /g/data/hh5/public/apps/dask-optimiser
+setenv DASK_DISTRIBUTED__CLIENT__PRELOAD $prefix/schedplugin.py
+
+if { [ is-loaded conda ]  || [ is-loaded conda_concept ] } {
+	set conda_name conda
+	set conda_version [lindex [split $::env(CONDA_PREFIX) {/}] end ]
+}
+
+set host [ exec hostname -i ]
+set groups [exec id -Gn]
+set spaths {}
+foreach g $groups {
+	if { [ file isdirectory /scratch/$g ] } {
+		lappend spaths scratch/$g
+	}
+	if { [ file isdirectory /g/data/$g ] } {
+		lappend spaths gdata/$g
+	}
+}
+set storagestr \[\"-lstorage=
+append storagestr [ join $spaths + ]
+append storagestr \",\]
+
+if { [ is-loaded conda_concept ] } {
+	set conda_name conda_concept
+	setenv DASK_JOBQUEUE__PBS__SCHEDULER_OPTIONS { {"protocol":"ucx://"} }
+}
+
+setenv DASK_JOBQUEUE__PBS__INTERFACE ib0
+setenv DASK_JOBQUEUE__PBS__JOB_EXTRA_DIRECTIVES $storagestr
+setenv DASK_JOBQUEUE__PBS__JOB_DIRECTIVES_SKIP {["select",]}
+setenv DASK_JOBQUEUE__PBS__JOB_SCRIPT_PROLOGUE \[\"module\ use\ /g/data/hh5/public/modules\",\"module\ load\ $conda_name/$conda_version\"\]
