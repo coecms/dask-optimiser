@@ -6,14 +6,12 @@ import os
 import fcntl
 import signal
 import uuid
-from typing import Dict, Any, Callable, List, Optional
+from typing import Dict, Any, Callable, List, Optional, Tuple
 from distributed.client import Client
 from distributed import Worker, LocalCluster
 from distributed.diagnostics.plugin import WorkerPlugin
 from distributed.core import rpc
 from distributed.worker import logger
-
-import time
 
 worker_override_params: Dict[str,Any]={"memory_limit":0,"nthreads":1}
 ### Treat the params below as analogies of each other
@@ -25,13 +23,14 @@ worker_dependent_params: Dict[str,List[str]]={"nthreads":["n_workers"],"memory_l
 
 ### Worker Plugin definition
 class BindWorker(WorkerPlugin):
-    def __init__(self, lock_suffix: str):
+    def __init__(self, lock_suffix: str, slots_requested: Optional[Tuple[int,int]]):
         ### Main worker process is never bound
         self.slots_requested = None
         self.slots_available = None
         self.lock_suffix = lock_suffix
         self.lock_fn = None
-        
+        self.slots_requested = slots_requested
+
         self.lock_file_fd=None
         self.default_signal_handlers={}
 
@@ -72,7 +71,7 @@ class BindWorker(WorkerPlugin):
             self.slots_available=os.sched_getaffinity(os.getppid())
 
         ### User has requested overcommitting, do not bind
-        if len(self.slots_available) < self.slots_requested:
+        if len(self.slots_available) < self.slots_requested[0] * self.slots_requested[1]:
             return
         
         ### Maybe we've already been bound?
@@ -87,16 +86,26 @@ class BindWorker(WorkerPlugin):
         fcntl.lockf(self.lock_file_fd,fcntl.LOCK_EX)
         self.register_signal_handler()
 
+        ### If we're undercommitting, we may want to assign more slots
+        ### per worker than the number of threads (but not bind to them)
+        slots_per_worker = self._reserved_slots_per_worker()
+
         ### Inspect our sibling processes and figure out where our
         ### next available slots are
         self.worker.pid=os.getpid()
         taken_slots=set()
         siblings=[ w.pid for w in psutil.Process(os.getppid()).children() if w.pid != self.worker.pid ]
         for s in siblings:
-            if os.sched_getaffinity(s) != self.slots_available:
-                taken_slots = taken_slots | os.sched_getaffinity(s)
+            sibling_affinity = os.sched_getaffinity(s)
+            if sibling_affinity != self.slots_available:
+                ### When figuring out taken slots, assume we're taking the nearest (slots_per_worker - nthreads) cores after
+                ### nthreads cores returned by the getaffinity call
+                for i in range(min(sibling_affinity),min(sibling_affinity)+slots_per_worker):
+                    taken_slots.add(i)
+                #sibling_affinity = sibling_affinity | set( range(max(sibling_affinity)+len(sibling_affinity)-1,max(sibling_affinity)+slots_per_worker) )
+                #taken_slots = taken_slots | sibling_affinity
 
-        ### Bind to those slots
+        ### Bind to the number of requested threads
         os.sched_setaffinity(0,set(sorted(list(self.slots_available - taken_slots))[:self.worker.state.nthreads]))
  
         ### Release the lock
@@ -105,6 +114,13 @@ class BindWorker(WorkerPlugin):
         self.deregister_signal_handler()
         f.close()
     
+    def _reserved_slots_per_worker(self):
+        ### If we've been launched via PBSCluster, used the data from derive_slots_requested
+        if self.slots_requested[0] < len(self.slots_available):
+            ### Undercommitting
+            return len(self.slots_available) // self.slots_requested[0]
+        return 1
+
     def _derive_slots_requested(self):
         ### An ugly hack assuming we've been launched by a dask worker from e.g. a PBSCluster
         nthreads=1
@@ -116,8 +132,7 @@ class BindWorker(WorkerPlugin):
             elif arg=="--nworkers":
                 nprocs=int(cmdline[i+1])
         
-        self.slots_requested=nthreads*nprocs
-
+        self.slots_requested=(nprocs, nthreads)
 
 def override_worker_opts(opts: Dict[str,Any],client_args: Dict[str,Any]):
     out = opts
@@ -148,17 +163,28 @@ async def _wrap_awaitable(aw: Callable):
 
 async def dask_setup(dask_client: Client):
 
-    ### Register worker plugin first thing
-    plugin = BindWorker(str(uuid.uuid1()))
-    await dask_client.upload_file(__file__)
-    await dask_client.register_worker_plugin(plugin)
-
     ### Do nothing if we're not in PBS
     if not os.getenv("PBS_NCPUS"):
         return
 
+    nworkers=None
+    if isinstance(dask_client.cluster,LocalCluster):
+        nworkers = ( len(dask_client.cluster.workers), min(i.nthreads for i in dask_client.cluster.workers.values()) )
+
+
+    ### Register worker plugin first thing
+    plugin = BindWorker(str(uuid.uuid1()),nworkers)
+    await dask_client.upload_file(__file__)
+    await dask_client.register_worker_plugin(plugin)
+
     ### The rest of this is only for local clusters:
     if not isinstance(dask_client.cluster,LocalCluster):
+        return
+
+    ### If we've been passed a LocalCluster object, not much we can
+    ### do at this point unless we figure out how to pull out the
+    ### users intention.
+    if dask_client._start_arg or "address" in dask_client._startup_kwargs:
         return
 
     ### Definitely a LocalCluster, which means we've already

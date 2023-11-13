@@ -31,4 +31,7 @@ if { [ is-loaded conda_concept ] } {
 setenv DASK_JOBQUEUE__PBS__INTERFACE ib0
 setenv DASK_JOBQUEUE__PBS__JOB_EXTRA_DIRECTIVES $storagestr
 setenv DASK_JOBQUEUE__PBS__JOB_DIRECTIVES_SKIP {["select",]}
-setenv DASK_JOBQUEUE__PBS__JOB_SCRIPT_PROLOGUE \[\"module\ use\ /g/data/hh5/public/modules\",\"module\ load\ $conda_name/$conda_version\"\]
+
+if { [ info exists conda_name ] } {
+	setenv DASK_JOBQUEUE__PBS__JOB_SCRIPT_PROLOGUE \[\"module\ use\ /g/data/hh5/public/modules\",\"module\ load\ $conda_name/$conda_version\"\]
+}
