@@ -35,3 +35,16 @@ setenv DASK_JOBQUEUE__PBS__JOB_DIRECTIVES_SKIP {["select",]}
 if { [ info exists conda_name ] } {
 	setenv DASK_JOBQUEUE__PBS__JOB_SCRIPT_PROLOGUE \[\"module\ use\ /g/data/hh5/public/modules\",\"module\ load\ $conda_name/$conda_version\"\]
 }
+
+if { [ info exists ::env(CONFIG_FILE) ] } {
+	if { [ file exists $::env(CONFIG_FILE) ] } {
+		set a [open $::env(CONFIG_FILE) ]
+		set lines [ split [read $a] "\n"]
+		close $a
+		foreach line $lines {
+			if { [ string match c.NotebookApp.base_url [ lindex $line 0 ] ] } {
+				setenv DASK_DISTRIBUTED__DASHBOARD__LINK [ string map { ' {} } [ lindex $line 2 ] ]proxy/{port}/status
+			}
+		}
+	}
+}
