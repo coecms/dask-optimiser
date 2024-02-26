@@ -95,15 +95,18 @@ class BindWorker(WorkerPlugin):
         self.worker.pid=os.getpid()
         taken_slots=set()
         siblings=[ w.pid for w in psutil.Process(os.getppid()).children() if w.pid != self.worker.pid ]
+
+        slot_list = sorted(list(self.slots_available))
+
         for s in siblings:
             sibling_affinity = os.sched_getaffinity(s)
             if sibling_affinity != self.slots_available:
                 ### When figuring out taken slots, assume we're taking the nearest (slots_per_worker - nthreads) cores after
                 ### nthreads cores returned by the getaffinity call
-                for i in range(min(sibling_affinity),min(sibling_affinity)+slots_per_worker):
-                    taken_slots.add(i)
-                #sibling_affinity = sibling_affinity | set( range(max(sibling_affinity)+len(sibling_affinity)-1,max(sibling_affinity)+slots_per_worker) )
-                #taken_slots = taken_slots | sibling_affinity
+                start = slot_list.index(min(sibling_affinity))
+                end = start + slots_per_worker
+                for i in range(start,end):
+                    taken_slots.add(slot_list[i])
 
         ### Bind to the number of requested threads
         os.sched_setaffinity(0,set(sorted(list(self.slots_available - taken_slots))[:self.worker.state.nthreads]))
@@ -168,103 +171,100 @@ async def dask_setup(dask_client: Client):
         return
 
     nworkers=None
+
+    ### This bit is only for local clusters:
     if isinstance(dask_client.cluster,LocalCluster):
-        nworkers = ( len(dask_client.cluster.workers), min(i.nthreads for i in dask_client.cluster.workers.values()) )
 
+        ### If we've been passed a LocalCluster object, not much we can
+        ### do at this point unless we figure out how to pull out the
+        ### users intention.
+        if dask_client._start_arg or "address" in dask_client._startup_kwargs:
+            return
 
-    ### Register worker plugin first thing
-    plugin = BindWorker(str(uuid.uuid1()),nworkers)
-    await dask_client.upload_file(__file__)
-    await dask_client.register_worker_plugin(plugin)
+        ### Definitely a LocalCluster, which means we've already
+        ### launched workers. Get their details now
+        slots=sum(i.nthreads for i in dask_client.cluster.workers.values())
 
-    ### The rest of this is only for local clusters:
-    if not isinstance(dask_client.cluster,LocalCluster):
-        return
+        ### Try not to use 'hidden' attributes
+        client_args=dask_client._startup_kwargs.copy()
+        for k,v in worker_analogy_params.items():
+            if k in client_args:
+                client_args[v]=client_args[k]
+                del client_args[k]
 
-    ### If we've been passed a LocalCluster object, not much we can
-    ### do at this point unless we figure out how to pull out the
-    ### users intention.
-    if dask_client._start_arg or "address" in dask_client._startup_kwargs:
-        return
+        new_spec=dask_client.cluster.new_spec.copy()
+        worker_spec=dask_client.cluster.worker_spec.copy()
 
-    ### Definitely a LocalCluster, which means we've already
-    ### launched workers. Get their details now
-    slots=sum(i.nthreads for i in dask_client.cluster.workers.values())
+        if will_modify(client_args,new_spec.get("options",{}),worker_override_params):
+            print("Modifying workers")
 
-    ### Try not to use 'hidden' attributes
-    client_args=dask_client._startup_kwargs.copy()
-    for k,v in worker_analogy_params.items():
-        if k in client_args:
-            client_args[v]=client_args[k]
-            del client_args[k]
-
-    new_spec=dask_client.cluster.new_spec.copy()
-    worker_spec=dask_client.cluster.worker_spec.copy()
-
-    if will_modify(client_args,new_spec.get("options",{}),worker_override_params):
-        print("Modifying workers")
-
-        ### Set the new worker spec
-        cls,opts=new_spec["cls"], new_spec.get("options",{})
-        opts=opts.copy()
-        opts = override_worker_opts(opts,client_args)
-        dask_client.cluster.new_spec={"cls":cls,"options":opts}
-
-        ### Would have been nice
-        #await dask_client.cluster.scale(0)
-        #print(dask_client.cluster.new_spec)
-        #await dask_client.cluster.scale(workers_to_launch)
-
-        ### Copied from dask.distributed.deploy.spec.py l 365-388
-        workers=[]
-        my_worker_spec={}
-
-        for k,v in worker_spec.items():
-            cls,opts=v["cls"], v.get("options",{})
+            ### Set the new worker spec
+            cls,opts=new_spec["cls"], new_spec.get("options",{})
             opts=opts.copy()
             opts = override_worker_opts(opts,client_args)
-            my_worker_spec[k]={"cls":v["cls"],"options":opts}
-            if "name" not in opts:
-                opts["name"]=k
-        
-            worker = cls(
-                getattr(dask_client.cluster.scheduler,"contact_address",None) 
-                or dask_client.scheduler.addr,
-                **opts,
-            )
-            workers.append(worker)
+            dask_client.cluster.new_spec={"cls":cls,"options":opts}
 
-        ### Do we need more workers? ONLY EVALUATE THIS IF THE USER DID NOT SPECIFY nthreads or n_workers
-        if "nthreads" not in client_args and "n_workers" not in client_args and len(workers) < slots:
-            cls, opts = new_spec["cls"], new_spec.get("options",{})
-            opts = opts.copy()
-            opts = override_worker_opts(opts,client_args)
-            for i in range(len(workers),slots):
-                i_opts=opts.copy()
-                my_worker_spec[i]={"cls":cls,"options":i_opts}
+            ### Would have been nice
+            #await dask_client.cluster.scale(0)
+            #print(dask_client.cluster.new_spec)
+            #await dask_client.cluster.scale(workers_to_launch)
+
+            ### Copied from dask.distributed.deploy.spec.py l 365-388
+            workers=[]
+            my_worker_spec={}
+
+            for k,v in worker_spec.items():
+                cls,opts=v["cls"], v.get("options",{})
+                opts=opts.copy()
+                opts = override_worker_opts(opts,client_args)
+                my_worker_spec[k]={"cls":v["cls"],"options":opts}
                 if "name" not in opts:
-                    i_opts["name"]=i
+                    opts["name"]=k
+
                 worker = cls(
                     getattr(dask_client.cluster.scheduler,"contact_address",None) 
                     or dask_client.scheduler.addr,
-                    **i_opts,
+                    **opts,
                 )
                 workers.append(worker)
 
-        if dask_client.cluster.workers:
-            await asyncio.wait(
-                            [asyncio.create_task(w.close()) for w in dask_client.cluster.workers.values()]
-                        )
-    
-        if workers:
-            await asyncio.wait(
-                [asyncio.create_task(_wrap_awaitable(w)) for w in workers]
+            ### Do we need more workers? ONLY EVALUATE THIS IF THE USER DID NOT SPECIFY nthreads or n_workers
+            if "nthreads" not in client_args and "n_workers" not in client_args and len(workers) < slots:
+                cls, opts = new_spec["cls"], new_spec.get("options",{})
+                opts = opts.copy()
+                opts = override_worker_opts(opts,client_args)
+                for i in range(len(workers),slots):
+                    i_opts=opts.copy()
+                    my_worker_spec[i]={"cls":cls,"options":i_opts}
+                    if "name" not in opts:
+                        i_opts["name"]=i
+                    worker = cls(
+                        getattr(dask_client.cluster.scheduler,"contact_address",None)
+                        or dask_client.scheduler.addr,
+                        **i_opts,
                     )
-            for w in workers:
-                w._cluster = weakref.ref(dask_client.cluster)
-                await w  # for tornado gen.coroutine support
+                    workers.append(worker)
 
-        dask_client.cluster.workers={ w.name:w for w in workers }
-        dask_client.cluster.worker_spec=my_worker_spec
+            if dask_client.cluster.workers:
+                await asyncio.wait(
+                                [asyncio.create_task(w.close()) for w in dask_client.cluster.workers.values()]
+                            )
 
+            if workers:
+                await asyncio.wait(
+                    [asyncio.create_task(_wrap_awaitable(w)) for w in workers]
+                        )
+                for w in workers:
+                    w._cluster = weakref.ref(dask_client.cluster)
+                    await w  # for tornado gen.coroutine support
+
+            dask_client.cluster.workers={ w.name:w for w in workers }
+            dask_client.cluster.worker_spec=my_worker_spec
+
+        nworkers = ( len(dask_client.cluster.workers), min(i.nthreads for i in dask_client.cluster.workers.values()) )
+
+    ### Register worker plugin after we've finalised workers
+    plugin = BindWorker(str(uuid.uuid1()),nworkers)
+    await dask_client.upload_file(__file__)
+    await dask_client.register_worker_plugin(plugin)
     
