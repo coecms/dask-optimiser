@@ -8,10 +8,8 @@ import signal
 import uuid
 from typing import Dict, Any, Callable, List, Optional, Tuple
 from distributed.client import Client
-from distributed import Worker, LocalCluster
+from distributed import Worker, LocalCluster, warn
 from distributed.diagnostics.plugin import WorkerPlugin
-from distributed.core import rpc
-from distributed.worker import logger
 
 worker_override_params: Dict[str,Any]={"memory_limit":0,"nthreads":1}
 ### Treat the params below as analogies of each other
@@ -46,7 +44,6 @@ class BindWorker(WorkerPlugin):
             except OSError:
                 ### Handle signals we aren't allowed to modify
                 pass
-            
 
     def deregister_signal_handler(self):
         for sig in range(1, signal.NSIG):
@@ -55,7 +52,43 @@ class BindWorker(WorkerPlugin):
             except KeyError:
                 pass
 
-    
+    def cpus_from_cpuset(self):
+
+        try:
+            with open('/proc/self/cpuset','r') as f:
+                cpuset_path=f.read().strip()
+        except FileNotFoundError:
+            warn("cpuset file does not exist - cannot bind")
+            return
+
+        try:
+            with open('/sys/fs/cgroup/cpuset' + cpuset_path + '/cpuset.cpus','r') as f:
+                cpu_list=f.read().strip()
+        except FileNotFoundError:
+            warn("cgroup file does not exist - cannot bind")
+            return
+
+        cpuset=set()
+        ### Parse cpu list
+        for r in cpu_list.split(','):
+            if '-' in r:
+                try:
+                    start = int(( r_split := r.split('-') )[0])
+                    end   = int(r_split[1]) + 1
+                except ValueError:
+                    warn("cpuset in unexpected format, cannot bind")
+                    return
+                cpuset |= set(range(start,end))
+            else:
+                try:
+                    cpuset.add(int(r))
+                except ValueError:
+                    warn("cpuset in unexpected format, cannot bind")
+                    return
+
+        self.slots_available = cpuset
+        return
+
     def setup(self,worker: Worker):
 
         ### Do nothing if we're not in PBS
@@ -67,8 +100,13 @@ class BindWorker(WorkerPlugin):
         if not self.slots_requested:
             self._derive_slots_requested()
 
+        ### Can't rely on parent's binding to determine this
         if not self.slots_available:
-            self.slots_available=os.sched_getaffinity(os.getppid())
+            self.cpus_from_cpuset()
+
+        if not self.slots_available:
+            ### Could not derive available CPUs, can't bind
+            return
 
         ### User has requested overcommitting, do not bind
         if len(self.slots_available) < self.slots_requested[0] * self.slots_requested[1]:
@@ -103,13 +141,24 @@ class BindWorker(WorkerPlugin):
             if sibling_affinity != self.slots_available:
                 ### When figuring out taken slots, assume we're taking the nearest (slots_per_worker - nthreads) cores after
                 ### nthreads cores returned by the getaffinity call
-                start = slot_list.index(min(sibling_affinity))
+                try:
+                    start = slot_list.index(min(sibling_affinity))
+                except ValueError:
+                    ### Somehow our sibling has bound to a core we don't recongnise
+                    ### If we don't recognise it, we can't bind to it, so press on.
+                    warn(f"Sibling bound to unknown CPU: {start}")
+                    continue
                 end = start + slots_per_worker
                 for i in range(start,end):
                     taken_slots.add(slot_list[i])
 
         ### Bind to the number of requested threads
-        os.sched_setaffinity(0,set(sorted(list(self.slots_available - taken_slots))[:self.worker.state.nthreads]))
+        try:
+            os.sched_setaffinity(0,set(sorted(list(self.slots_available - taken_slots))[:self.worker.state.nthreads]))
+        except OSError:
+            ### Attempted binding we're not allowed to do.
+            warn(f"Attempted illegal binding: {(sorted(list(self.slots_available - taken_slots))[:self.worker.state.nthreads])}")
+            pass
  
         ### Release the lock
         fcntl.lockf(f.fileno(),fcntl.LOCK_UN)
